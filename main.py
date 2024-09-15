@@ -1,90 +1,111 @@
 import pandas as pd
 import numpy as np
-import os
-from tqdm import tqdm
-from pathlib import Path
-from keras.applications import ResNet50
-from keras.applications.resnet import preprocess_input
-from keras.preprocessing import image
-from keras.models import Model
+import tensorflow as tf
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.applications.resnet50 import preprocess_input
+from tensorflow.keras.preprocessing import image
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Dense, GlobalAveragePooling2D
+from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.preprocessing.image import img_to_array
+from tensorflow.keras.utils import to_categorical
+from sklearn.preprocessing import LabelEncoder
 from sklearn.model_selection import train_test_split
-from sklearn.linear_model import Ridge
 from src.utils import download_images
 from src.sanity import sanity_check
 
-# Function to load and preprocess images for ResNet-50
-def load_and_preprocess_image(img_path):
-    try:
-        img = image.load_img(img_path, target_size=(224, 224))
-        img_array = image.img_to_array(img)
-        img_array = np.expand_dims(img_array, axis=0)
-        img_array = preprocess_input(img_array)
-        return img_array
-    except Exception as e:
-        print(f"Error loading image {img_path}: {e}")
-        return None
+# Helper function to preprocess images
+def preprocess_image(img_path, target_size=(224, 224)):
+    img = image.load_img(img_path, target_size=target_size)
+    img_array = img_to_array(img)
+    img_array = preprocess_input(img_array)
+    return img_array
 
-# Function to extract features using ResNet-50
-def extract_features(img_dir, image_ids):
+def build_model(num_classes):
     base_model = ResNet50(weights='imagenet', include_top=False, input_shape=(224, 224, 3))
-    model = Model(inputs=base_model.input, outputs=base_model.output)
-    
+    x = base_model.output
+    x = GlobalAveragePooling2D()(x)
+    x = Dense(1024, activation='relu')(x)
+    predictions = Dense(num_classes, activation='softmax')(x)
+    model = Model(inputs=base_model.input, outputs=predictions)
+
+    for layer in base_model.layers:
+        layer.trainable = False
+
+    model.compile(optimizer=Adam(), loss='categorical_crossentropy', metrics=['accuracy'])
+    return model
+
+def extract_features(model, image_paths):
     features = []
-    for image_id in tqdm(image_ids):
-        img_path = os.path.join(img_dir, f"{image_id}.jpg")
-        img_array = load_and_preprocess_image(img_path)
-        if img_array is not None:
-            feature = model.predict(img_array)
-            features.append(feature.flatten())
-        else:
-            features.append(np.zeros((7 * 7 * 2048)))  # Assuming the output of ResNet-50
+    for img_path in image_paths:
+        img_array = preprocess_image(img_path)
+        img_array = np.expand_dims(img_array, axis=0)
+        feature = model.predict(img_array)
+        features.append(feature.flatten())
     return np.array(features)
 
 def main():
-    # Step 1: Download images
+    # Download images
     download_images('dataset/train.csv')
     download_images('dataset/test.csv')
 
-    # Step 2: Load datasets
+    # Load data
     train_df = pd.read_csv('dataset/train.csv')
     test_df = pd.read_csv('dataset/test.csv')
 
-    # Step 3: Extract features using ResNet-50 for training and test data
-    train_image_ids = train_df['index']
-    test_image_ids = test_df['index']
+    # Process entity_value to extract numeric values
+    def extract_numeric_value(value):
+        try:
+            return float(value.split()[0])
+        except:
+            return np.nan
     
-    print("Extracting features for training data...")
-    train_features = extract_features('dataset/images', train_image_ids)
-    
-    print("Extracting features for test data...")
-    test_features = extract_features('dataset/images', test_image_ids)
+    train_df['entity_value_numeric'] = train_df['entity_value'].apply(extract_numeric_value)
 
-    # Step 4: Prepare target variable (entity_value) for training
-    train_df['entity_value_numeric'] = train_df['entity_value'].apply(lambda x: float(x.split()[0]) if isinstance(x, str) else 0)
-    train_target = train_df['entity_value_numeric']
+    # Ensure 'index' column is present in both dataframes
+    if 'index' not in train_df.columns or 'index' not in test_df.columns:
+        raise ValueError("'index' column is missing in one of the CSV files")
 
-    # Step 5: Train a simple Ridge regression model to predict entity values
-    print("Training Ridge regression model...")
-    X_train, X_val, y_train, y_val = train_test_split(train_features, train_target, test_size=0.2, random_state=42)
-    model = Ridge()
-    model.fit(X_train, y_train)
+    # Encode categorical labels
+    le = LabelEncoder()
+    train_df['entity_name_encoded'] = le.fit_transform(train_df['entity_name'])
 
-    # Step 6: Generate predictions for the test dataset
-    print("Generating predictions...")
-    test_predictions = model.predict(test_features)
+    # Prepare image paths and labels
+    image_paths = train_df.apply(lambda row: f'dataset/images/{row["index"]}.jpg', axis=1)
+    labels = train_df['entity_name_encoded']
+    num_classes = len(le.classes_)
 
-    # Step 7: Format predictions with allowed units (Append units to numeric predictions)
-    ALLOWED_UNITS = [
-        "gram", "kilogram", "ounce", "centimetre", "metre", "inch", "watt", "volt"
-    ]
-    
-    test_df['prediction'] = test_predictions.astype(str) + " " + ALLOWED_UNITS[0]  # Example: Assign first unit (modify as needed)
-    
-    # Step 8: Save the predictions to the output file
-    output_df = test_df[['index', 'prediction']]
+    # Split data
+    X_train, X_val, y_train, y_val = train_test_split(image_paths, labels, test_size=0.2, random_state=42)
+
+    # Build and train the model
+    model = build_model(num_classes)
+    train_features = extract_features(model, X_train)
+    val_features = extract_features(model, X_val)
+
+    y_train_encoded = to_categorical(y_train, num_classes=num_classes)
+    y_val_encoded = to_categorical(y_val, num_classes=num_classes)
+
+    model.fit(train_features, y_train_encoded, validation_data=(val_features, y_val_encoded), epochs=5, batch_size=32)
+
+    # Predict on test data
+    test_image_paths = test_df.apply(lambda row: f'dataset/images/{row["index"]}.jpg', axis=1)
+    test_features = extract_features(model, test_image_paths)
+
+    # Generate predictions
+    predictions = model.predict(test_features)
+    predicted_classes = np.argmax(predictions, axis=1)
+    predicted_values = le.inverse_transform(predicted_classes)
+
+    # Prepare output
+    output_df = pd.DataFrame({
+        'index': test_df['index'],
+        'prediction': predicted_values
+    })
+
     output_df.to_csv('test_out.csv', index=False)
-    
-    # Step 9: Perform sanity check on the output file
+
+    # Perform sanity check
     sanity_check('test_out.csv')
 
 if __name__ == "__main__":
